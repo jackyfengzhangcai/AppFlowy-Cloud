@@ -1,0 +1,78 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  deploy:
+    name: Deploy AppFlowy Cloud to Production Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            #!/bin/bash
+            set -e
+
+            # 进入项目目录
+            cd /www/wwwroot/AppFlowy-Cloud
+
+            # 更新代码
+            git reset --hard HEAD
+            git pull
+
+            # 生成 .env 文件 (确保自定义配置优先并正确合并 deploy.env)
+            cat <<EOF > .env
+            # 自定义覆盖配置
+            FQDN=${{ secrets.FQDN }}
+            SCHEME=${{ secrets.SCHEME }}
+            WS_SCHEME=${{ secrets.WS_SCHEME }}
+            POSTGRES_HOST=${{ secrets.BASE_HOST }}
+            POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+            POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            POSTGRES_PORT=${{ secrets.POSTGRES_PORT }}
+            POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+            REDIS_HOST=${{ secrets.BASE_HOST }}
+            REDIS_PORT=${{ secrets.REDIS_PORT }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            GOTRUE_ADMIN_EMAIL=${{ secrets.GOTRUE_ADMIN_EMAIL }}
+            GOTRUE_ADMIN_PASSWORD=${{ secrets.GOTRUE_ADMIN_PASSWORD }}
+            GOTRUE_SMTP_HOST=${{ secrets.GOTRUE_SMTP_HOST }}
+            GOTRUE_SMTP_PORT=${{ secrets.GOTRUE_SMTP_PORT }}
+            GOTRUE_SMTP_USER=${{ secrets.GOTRUE_SMTP_USER }}
+            GOTRUE_SMTP_PASS=${{ secrets.GOTRUE_SMTP_PASS }}
+            GOTRUE_SMTP_ADMIN_EMAIL=${{ secrets.GOTRUE_SMTP_ADMIN_EMAIL }}
+EOF
+
+            # If REDIS_PASSWORD is set, use it to construct the URIs
+            if [ -n "${{ secrets.REDIS_PASSWORD }}" ]; then
+              APPFLOWY_REDIS_URI=redis://:${{ secrets.REDIS_PASSWORD }}@${{ secrets.BASE_HOST }}:${{ secrets.REDIS_PORT }}
+            else
+              APPFLOWY_REDIS_URI=redis://${{ secrets.BASE_HOST }}:${{ secrets.REDIS_PORT }}
+            fi
+
+            cat <<EOF >> .env
+            APPFLOWY_REDIS_URI=$APPFLOWY_REDIS_URI
+            ADMIN_FRONTEND_REDIS_URL=$APPFLOWY_REDIS_URI
+            AI_REDIS_URL=$APPFLOWY_REDIS_URI
+            APPFLOWY_INDEXER_REDIS_URL=$APPFLOWY_REDIS_URI
+            APPFLOWY_WORKER_REDIS_URL=$APPFLOWY_REDIS_URI
+EOF
+
+            # 追加模板中的其余变量，过滤掉已覆盖的
+            grep -vE '^(FQDN|SCHEME|WS_SCHEME|POSTGRES_HOST|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_PORT|POSTGRES_DB|REDIS_HOST|REDIS_PORT|REDIS_PASSWORD|APPFLOWY_REDIS_URI|ADMIN_FRONTEND_REDIS_URL|AI_REDIS_URL|APPFLOWY_INDEXER_REDIS_URL|APPFLOWY_WORKER_REDIS_URL|GOTRUE_ADMIN_EMAIL|GOTRUE_ADMIN_PASSWORD|GOTRUE_SMTP_HOST|GOTRUE_SMTP_PORT|GOTRUE_SMTP_USER|GOTRUE_SMTP_PASS|GOTRUE_SMTP_ADMIN_EMAIL|AI_AZURE_OPENAI_API_BASE|AI_AZURE_OPENAI_API_KEY|AZURE_OPENAI_ENDPOINT|AZURE_OPENAI_API_KEY|AZURE_OPENAI_API_VERSION|APPFLOWY_S3_REGION|APPFLOWY_S3_USE_MINIO|APPFLOWY_S3_CREATE_BUCKET)=' deploy.env >> .env
+
+            # 拉取最新镜像并重启服务 (排除外部已有的数据库、Redis和MinIO)
+            docker compose pull
+            docker compose up -d --no-deps nginx gotrue appflowy_cloud admin_frontend ai appflowy_worker appflowy_web
+
+            echo "Deployment completed successfully!"
